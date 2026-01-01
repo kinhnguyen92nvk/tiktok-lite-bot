@@ -1,8 +1,6 @@
 /**
  * TIKTOK_LITE_BOT - CommonJS (require)
- * - Telegram bot
- * - Google Sheet as DB
- * - Render friendly
+ * Telegram bot + Google Sheets DB
  */
 
 const TelegramBot = require("node-telegram-bot-api");
@@ -37,21 +35,12 @@ SA_PRIVATE_KEY = SA_PRIVATE_KEY.replace(/\\n/g, "\n");
 // ===== BOT =====
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// ===== In-memory session state (for asking follow-up) =====
-/**
- * sessions[chatId] = {
- *   pending: {
- *     type: "ask_wallet_for_phone" | "ask_wallet_for_lot" | "ask_checkin_reward",
- *     data: {...}
- *   }
- * }
- */
-const sessions = new Map();
+// ===== Session state =====
+const sessions = new Map(); // chatId -> { pending: {...} }
 
-// ===== Google Sheet helper =====
+// ===== Google Sheet =====
 const doc = new GoogleSpreadsheet(SHEET_ID);
-
-let sheets = {}; // name -> worksheet
+const sheets = {}; // tabName -> worksheet
 
 async function initSheet() {
   await doc.useServiceAccountAuth({
@@ -75,14 +64,14 @@ async function initSheet() {
     "UNDO_LOG",
   ];
 
-  requiredTabs.forEach((name) => {
+  for (const name of requiredTabs) {
     const ws = doc.sheetsByTitle[name];
     if (!ws) {
       console.warn(`⚠️ Missing tab: ${name} (please create it in Google Sheet)`);
     } else {
       sheets[name] = ws;
     }
-  });
+  }
 
   console.log("✅ Sheet loaded:", doc.title);
 }
@@ -92,19 +81,15 @@ function nowSeoul() {
 }
 
 // ===== Money parser =====
-// Supports: 100k => 100000, 0.5k => 500, 120000 => 120000
+// 100k => 100000, 0.5k => 500, 120000 => 120000
 function parseMoney(input) {
   if (!input) return null;
-  const s = String(input).trim().toLowerCase();
-  const cleaned = s.replace(/,/g, "");
-  const m = cleaned.match(/^(\d+(\.\d+)?)(k)?$/);
+  const s = String(input).trim().toLowerCase().replace(/,/g, "");
+  const m = s.match(/^(\d+(\.\d+)?)(k)?$/);
   if (!m) return null;
-
   const num = Number(m[1]);
   if (Number.isNaN(num)) return null;
-
-  const isK = !!m[3];
-  return isK ? Math.round(num * 1000) : Math.round(num);
+  return m[3] ? Math.round(num * 1000) : Math.round(num);
 }
 
 function fmtMoney(n) {
@@ -116,18 +101,25 @@ function isAdmin(msg) {
   return ADMIN_ID && String(msg.from?.id || "") === ADMIN_ID;
 }
 
-// ===== Sheet row helpers =====
+// ===== Sheet helpers =====
 async function appendRow(tab, rowObj) {
   const ws = sheets[tab];
   if (!ws) throw new Error(`Missing sheet tab ${tab}`);
-  const row = await ws.addRow(rowObj);
-  return row;
+  return await ws.addRow(rowObj);
 }
 
 async function getAllRows(tab) {
   const ws = sheets[tab];
   if (!ws) throw new Error(`Missing sheet tab ${tab}`);
   return await ws.getRows();
+}
+
+async function logUndo(action, payload) {
+  await appendRow("UNDO_LOG", {
+    timestamp: nowSeoul().format(),
+    action,
+    payload: JSON.stringify(payload),
+  });
 }
 
 // ===== Wallets =====
@@ -156,39 +148,30 @@ async function upsertWalletBalance(wallet, delta, ref = "", note = "") {
   return next;
 }
 
-// ===== Undo log (simple) =====
-async function logUndo(action, payload) {
-  await appendRow("UNDO_LOG", {
-    timestamp: nowSeoul().format(),
-    action,
-    payload: JSON.stringify(payload),
-  });
-}
-
-// ===== Telegram menu =====
+// ===== Commands menu =====
 async function setupBotCommands() {
   await bot.setMyCommands([
     { command: "start", description: "Bắt đầu / hướng dẫn nhanh" },
     { command: "help", description: "Xem lệnh" },
     { command: "baocao", description: "Báo cáo tháng (tổng quan)" },
     { command: "pending", description: "Danh sách invite pending / quá hạn" },
-    { command: "undo", description: "Hoàn tác lệnh gần nhất (đang khung)" },
+    { command: "undo", description: "Hoàn tác lệnh gần nhất (khung)" },
   ]);
 }
 
-// ===== Core actions =====
+// ===== Core game =====
 async function addGameRevenue(chatId, game, amount, type, note = "", meta = {}) {
   await appendRow("GAME_REVENUE", {
     timestamp: nowSeoul().format(),
-    game, // db/hq/qr/other
-    type, // invite_reward/checkin_reward/other_income
+    game,
+    type,
     amount,
     note,
     chatId,
     ...meta,
   });
 
-  await logUndo("ADD_GAME_REVENUE", { game, amount, type, note, meta });
+  await logUndo("ADD_GAME_REVENUE", { chatId, game, amount, type, note, meta });
 }
 
 async function createInvite(chatId, game, name, email) {
@@ -197,7 +180,7 @@ async function createInvite(chatId, game, name, email) {
 
   await appendRow("INVITES", {
     timestamp: invitedAt.format(),
-    game, // hq/qr
+    game,
     name,
     email,
     time_invited: invitedAt.format(),
@@ -208,6 +191,7 @@ async function createInvite(chatId, game, name, email) {
   });
 
   await logUndo("ADD_INVITE", {
+    chatId,
     game,
     name,
     email,
@@ -215,13 +199,13 @@ async function createInvite(chatId, game, name, email) {
     due_date: due.format(),
   });
 
-  return { invitedAt, due };
+  return { due };
 }
 
 async function markInviteDoneAndAddCheckin(chatId, game, name, email, reward) {
   const rows = await getAllRows("INVITES");
 
-  let target = rows
+  const target = rows
     .filter(
       (r) =>
         String(r.status || "").toLowerCase() === "pending" &&
@@ -235,9 +219,7 @@ async function markInviteDoneAndAddCheckin(chatId, game, name, email, reward) {
         new Date(a.time_invited || a.timestamp)
     )[0];
 
-  if (!target) {
-    throw new Error(`Không tìm thấy invite pending cho ${game} ${name}`);
-  }
+  if (!target) throw new Error(`Không tìm thấy invite pending cho ${game} ${name}`);
 
   await appendRow("CHECKIN_REWARD", {
     timestamp: nowSeoul().format(),
@@ -249,14 +231,10 @@ async function markInviteDoneAndAddCheckin(chatId, game, name, email, reward) {
     chatId,
   });
 
-  await addGameRevenue(
-    chatId,
-    game,
-    reward,
-    "checkin_reward",
-    `checkin 14 ngày: ${target.name}`,
-    { name: target.name, email: target.email }
-  );
+  await addGameRevenue(chatId, game, reward, "checkin_reward", `checkin 14 ngày: ${target.name}`, {
+    name: target.name,
+    email: target.email,
+  });
 
   target.status = "done";
   target.checkin_reward = reward;
@@ -265,11 +243,10 @@ async function markInviteDoneAndAddCheckin(chatId, game, name, email, reward) {
 
   await logUndo("DONE_INVITE_CHECKIN", {
     inviteRowId: target._rowNumber,
+    chatId,
     game,
     reward,
   });
-
-  return target;
 }
 
 // ===== Phones / Lots =====
@@ -284,7 +261,7 @@ async function createPhone(chatId, phoneCode, buyPrice) {
     wallet: "",
     chatId,
   });
-  await logUndo("ADD_PHONE", { phoneCode, buyPrice, buyDate: ts });
+  await logUndo("ADD_PHONE", { chatId, phoneCode, buyPrice, buyDate: ts });
 }
 
 async function setPhoneWallet(phoneCode, wallet) {
@@ -297,7 +274,14 @@ async function setPhoneWallet(phoneCode, wallet) {
 
   target.wallet = wallet;
   await target.save();
-  return target;
+}
+
+function normalizeGameToken(tok) {
+  const t = String(tok || "").toLowerCase();
+  if (t === "hopqua" || t === "hq" || t === "hh") return "hq";
+  if (t === "qr") return "qr";
+  if (t === "dabong" || t === "db") return "db";
+  return t;
 }
 
 async function logPhoneProfit(phoneCode, gameSource, gameAmount) {
@@ -343,7 +327,7 @@ async function createLot(chatId, qty, totalCost) {
     wallet: "",
     chatId,
   });
-  await logUndo("ADD_LOT", { qty, totalCost, date: ts });
+  await logUndo("ADD_LOT", { chatId, qty, totalCost, date: ts });
 }
 
 async function getLatestLot() {
@@ -356,15 +340,6 @@ async function getLatestLot() {
 async function setLotWallet(lotRow, wallet) {
   lotRow.wallet = wallet;
   await lotRow.save();
-  return lotRow;
-}
-
-function normalizeGameToken(tok) {
-  const t = tok.toLowerCase();
-  if (t === "hopqua" || t === "hq" || t === "hh") return "hq";
-  if (t === "qr") return "qr";
-  if (t === "dabong" || t === "db") return "db";
-  return t;
 }
 
 async function saveLotResult(lotRow, { ok, tach, game, totalReward }) {
@@ -397,23 +372,13 @@ async function reportMonth(chatId, ym = nowSeoul().format("YYYY-MM")) {
     const g = String(r.game || "unknown");
     byGame[g] = (byGame[g] || 0) + (Number(r.amount) || 0);
   }
-
   const total = Object.values(byGame).reduce((a, v) => a + v, 0);
 
   let text = `📊 Báo cáo tháng ${ym}\n`;
-  text += `• Tổng thu TikTok (GAME_REVENUE): ${fmtMoney(total)}\n`;
+  text += `• Tổng thu TikTok: ${fmtMoney(total)}\n`;
   for (const [g, v] of Object.entries(byGame)) {
     text += `  - ${g}: ${fmtMoney(v)}\n`;
   }
-
-  const invites = await getAllRows("INVITES");
-  const invMonth = invites.filter((r) => String(r.time_invited || r.timestamp || "").startsWith(ym));
-  const pending = invMonth.filter((r) => String(r.status || "").toLowerCase() === "pending").length;
-  const done = invMonth.filter((r) => String(r.status || "").toLowerCase() === "done").length;
-
-  text += `\n👥 Invite (tháng ${ym})\n`;
-  text += `• Pending: ${pending}\n`;
-  text += `• Done: ${done}\n`;
 
   await bot.sendMessage(chatId, text);
 }
@@ -426,8 +391,7 @@ async function listPending(chatId) {
     .filter((r) => String(r.status || "").toLowerCase() === "pending")
     .map((r) => {
       const due = dayjs(r.due_date).tz(TZ);
-      const overdue = due.isBefore(now);
-      return { r, due, overdue };
+      return { r, due, overdue: due.isValid() && due.isBefore(now) };
     })
     .sort((a, b) => a.due.valueOf() - b.due.valueOf());
 
@@ -438,18 +402,13 @@ async function listPending(chatId) {
 
   let text = `🕒 Pending invites (${pending.length})\n`;
   for (const { r, due, overdue } of pending.slice(0, 50)) {
-    const game = r.game;
-    const name = r.name;
-    const email = r.email;
-    const dueStr = due.format("ddd DD/MM");
-    text += `• ${overdue ? "⚠️" : "⏳"} ${game} - ${name} (${email}) due: ${dueStr}\n`;
+    const dueStr = due.isValid() ? due.format("ddd DD/MM") : "invalid";
+    text += `• ${overdue ? "⚠️" : "⏳"} ${r.game} - ${r.name} (${r.email}) due: ${dueStr}\n`;
   }
-  if (pending.length > 50) text += `... còn ${pending.length - 50} dòng\n`;
-
   await bot.sendMessage(chatId, text);
 }
 
-// ===== Due reminder job =====
+// ===== Reminder cron =====
 async function runDueCheck() {
   try {
     const invites = await getAllRows("INVITES");
@@ -473,12 +432,7 @@ async function runDueCheck() {
         sessions.set(String(chatId), {
           pending: {
             type: "ask_checkin_reward",
-            data: {
-              game: String(r.game || "").toLowerCase(),
-              name: r.name,
-              email: r.email,
-              inviteRowNumber: r._rowNumber,
-            },
+            data: { game: String(r.game || "").toLowerCase(), name: r.name, email: r.email },
           },
         });
 
@@ -493,8 +447,8 @@ async function runDueCheck() {
 }
 
 function startCron() {
-  cron.schedule("0 10 * * *", runDueCheck, { timezone: TZ }); // daily 10:00
-  cron.schedule("15 * * * *", runDueCheck, { timezone: TZ }); // hourly safety
+  cron.schedule("0 10 * * *", runDueCheck, { timezone: TZ });
+  cron.schedule("15 * * * *", runDueCheck, { timezone: TZ });
 }
 
 // ===== Session helpers =====
@@ -507,23 +461,18 @@ function clearSession(chatId) {
 
 // ===== Follow-up handlers =====
 async function handleWalletAnswer(chatId, wallet, context) {
-  wallet = wallet.toLowerCase().trim();
-  if (!["uri", "hana", "kt"].includes(wallet)) {
+  const w = String(wallet || "").toLowerCase().trim();
+  if (!["uri", "hana", "kt"].includes(w)) {
     await bot.sendMessage(chatId, "Chỉ nhận: uri / hana / kt. Nhập lại:");
     return;
   }
 
   if (context.type === "ask_wallet_for_phone") {
     const { phoneCode, buyPrice } = context.data;
-
-    await setPhoneWallet(phoneCode, wallet);
-    const newBal = await upsertWalletBalance(wallet, -buyPrice, `PHONE:${phoneCode}`, "buy phone");
-
+    await setPhoneWallet(phoneCode, w);
+    const newBal = await upsertWalletBalance(w, -buyPrice, `PHONE:${phoneCode}`, "buy phone");
     clearSession(chatId);
-    await bot.sendMessage(
-      chatId,
-      `✅ Đã lưu mua máy ${phoneCode} giá ${fmtMoney(buyPrice)} từ ví ${wallet}.\n💳 Balance mới: ${fmtMoney(newBal)}`
-    );
+    await bot.sendMessage(chatId, `✅ Mua máy ${phoneCode}: -${fmtMoney(buyPrice)} từ ví ${w}. Balance: ${fmtMoney(newBal)}`);
     return;
   }
 
@@ -533,14 +482,10 @@ async function handleWalletAnswer(chatId, wallet, context) {
     const lotRow = lots.find((r) => r._rowNumber === lotRowNumber);
     if (!lotRow) throw new Error("Không tìm thấy LOT để set wallet");
 
-    await setLotWallet(lotRow, wallet);
-    const newBal = await upsertWalletBalance(wallet, -totalCost, `LOT:${lotRow.lotId}`, "buy lot");
-
+    await setLotWallet(lotRow, w);
+    const newBal = await upsertWalletBalance(w, -totalCost, `LOT:${lotRow.lotId}`, "buy lot");
     clearSession(chatId);
-    await bot.sendMessage(
-      chatId,
-      `✅ Đã lưu mua lô ${lotRow.lotId} (${lotRow.qty} máy) tổng ${fmtMoney(totalCost)} từ ví ${wallet}.\n💳 Balance mới: ${fmtMoney(newBal)}`
-    );
+    await bot.sendMessage(chatId, `✅ Mua lô ${lotRow.lotId}: -${fmtMoney(totalCost)} từ ví ${w}. Balance: ${fmtMoney(newBal)}`);
     return;
   }
 }
@@ -548,15 +493,13 @@ async function handleWalletAnswer(chatId, wallet, context) {
 async function handleCheckinAnswer(chatId, text, context) {
   const reward = parseMoney(text);
   if (reward == null) {
-    await bot.sendMessage(chatId, "Không parse được tiền. Ví dụ đúng: 60k hoặc 30000");
+    await bot.sendMessage(chatId, "Không parse được tiền. Ví dụ: 60k hoặc 30000");
     return;
   }
-
   const { game, name, email } = context.data;
   await markInviteDoneAndAddCheckin(chatId, game, name, email, reward);
-
   clearSession(chatId);
-  await bot.sendMessage(chatId, `✅ Đã ghi checkin ${game} ${name}: +${fmtMoney(reward)} (đã cộng vào GAME_REVENUE)`);
+  await bot.sendMessage(chatId, `✅ Checkin ${game} ${name}: +${fmtMoney(reward)}`);
 }
 
 function parseCommand(text) {
@@ -565,13 +508,13 @@ function parseCommand(text) {
   return { raw, parts };
 }
 
-// ===== Main handler =====
+// ===== Main message handler =====
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text || "";
 
   try {
-    // 1) Follow-up
+    // Follow-up
     const sess = getSession(chatId);
     if (sess?.pending?.type) {
       const pending = sess.pending;
@@ -587,7 +530,7 @@ bot.on("message", async (msg) => {
       }
     }
 
-    // 2) Slash commands
+    // Slash commands
     if (text.startsWith("/start")) {
       await bot.sendMessage(
         chatId,
@@ -619,12 +562,6 @@ bot.on("message", async (msg) => {
           "- qr <Name> <Email>\n" +
           "- qr 57k\n" +
           "- them 0.5k\n\n" +
-          "MÁY:\n" +
-          "- <phoneCode> <buyPrice>\n" +
-          "- <phoneCode> ok hopqua100k\n" +
-          "- mua <qty>may <totalCost>\n" +
-          "- <okCount>may hq ok tach<tachCount>\n" +
-          "- <qty>may hh800k tach1\n\n" +
           "BÁO CÁO:\n" +
           "- /baocao\n" +
           "- /pending\n"
@@ -633,8 +570,7 @@ bot.on("message", async (msg) => {
     }
 
     if (text.startsWith("/baocao")) {
-      const ym = nowSeoul().format("YYYY-MM");
-      await reportMonth(chatId, ym);
+      await reportMonth(chatId);
       return;
     }
 
@@ -644,20 +580,17 @@ bot.on("message", async (msg) => {
     }
 
     if (text.startsWith("/undo")) {
-      await bot.sendMessage(
-        chatId,
-        "⚠️ /undo: hiện mới ghi UNDO_LOG. Nếu bạn muốn rollback thật (xoá dòng vừa thêm + hoàn lại ví), mình sẽ implement tiếp."
-      );
+      await bot.sendMessage(chatId, "⚠️ /undo: hiện mới log UNDO_LOG. Muốn rollback thật mình sẽ làm tiếp.");
       return;
     }
 
-    // 3) Free text commands
+    // Free text commands
     const { parts } = parseCommand(text);
     if (parts.length === 0) return;
 
     const cmd = parts[0].toLowerCase();
 
-    // --- GAME: dabong ---
+    // GAME: dabong
     if (cmd === "dabong" || cmd === "db") {
       const amount = parseMoney(parts[1]);
       if (amount == null) {
@@ -669,7 +602,7 @@ bot.on("message", async (msg) => {
       return;
     }
 
-    // --- GAME: hopqua ---
+    // GAME: hopqua
     if (cmd === "hopqua" || cmd === "hq") {
       if (parts.length === 2) {
         const amount = parseMoney(parts[1]);
@@ -686,10 +619,7 @@ bot.on("message", async (msg) => {
         const name = parts[1];
         const email = parts[2];
         const { due } = await createInvite(chatId, "hq", name, email);
-        await bot.sendMessage(
-          chatId,
-          `✅ Đã lưu invite HQ: ${name} (${email})\n⏰ Due (14 ngày): ${due.format("ddd DD/MM")} (${TZ})`
-        );
+        await bot.sendMessage(chatId, `✅ Đã lưu invite HQ: ${name} (${email})\n⏰ Due: ${due.format("ddd DD/MM")} (${TZ})`);
         return;
       }
 
@@ -697,7 +627,7 @@ bot.on("message", async (msg) => {
       return;
     }
 
-    // --- GAME: qr ---
+    // GAME: qr
     if (cmd === "qr") {
       if (parts.length === 2) {
         const amount = parseMoney(parts[1]);
@@ -714,10 +644,7 @@ bot.on("message", async (msg) => {
         const name = parts[1];
         const email = parts[2];
         const { due } = await createInvite(chatId, "qr", name, email);
-        await bot.sendMessage(
-          chatId,
-          `✅ Đã lưu invite QR: ${name} (${email})\n⏰ Due (14 ngày): ${due.format("ddd DD/MM")} (${TZ})`
-        );
+        await bot.sendMessage(chatId, `✅ Đã lưu invite QR: ${name} (${email})\n⏰ Due: ${due.format("ddd DD/MM")} (${TZ})`);
         return;
       }
 
@@ -725,7 +652,7 @@ bot.on("message", async (msg) => {
       return;
     }
 
-    // --- other income ---
+    // other income
     if (cmd === "them") {
       const amount = parseMoney(parts[1]);
       if (amount == null) {
@@ -733,11 +660,11 @@ bot.on("message", async (msg) => {
         return;
       }
       await addGameRevenue(chatId, "other", amount, "other_income", "other income");
-      await bot.sendMessage(chatId, `✅ THÊM +${fmtMoney(amount)} (other income)`);
+      await bot.sendMessage(chatId, `✅ THÊM +${fmtMoney(amount)}`);
       return;
     }
 
-    // --- admin: chinh wallet ---
+    // admin set wallet
     if (cmd === "chinh") {
       if (!isAdmin(msg)) {
         await bot.sendMessage(chatId, "⛔ Bạn không có quyền dùng lệnh này.");
@@ -769,11 +696,48 @@ bot.on("message", async (msg) => {
         note: `set balance to ${amount}`,
       });
 
-      await bot.sendMessage(chatId, `✅ Đã set ví ${wallet} = ${fmtMoney(amount)} (delta ${fmtMoney(delta)})`);
+      await bot.sendMessage(chatId, `✅ Set ví ${wallet} = ${fmtMoney(amount)} (delta ${fmtMoney(delta)})`);
       return;
     }
 
-    // --- LOT: mua 5may 120k ---
+    // buy phone: <code> <price>
+    const maybePrice = parts[1] ? parseMoney(parts[1]) : null;
+    if (parts.length === 2 && maybePrice != null && /^[a-z0-9]+$/i.test(cmd)) {
+      const phoneCode = parts[0];
+      const buyPrice = maybePrice;
+
+      await createPhone(chatId, phoneCode, buyPrice);
+
+      sessions.set(String(chatId), {
+        pending: { type: "ask_wallet_for_phone", data: { phoneCode, buyPrice } },
+      });
+
+      await bot.sendMessage(chatId, `✅ Đã lưu mua máy ${phoneCode} giá ${fmtMoney(buyPrice)}.\nTiền từ ví nào? (uri/hana/kt)`);
+      return;
+    }
+
+    // phone ok: <code> ok hopqua100k
+    if (parts.length >= 3 && /^[a-z0-9]+$/i.test(cmd) && parts[1].toLowerCase() === "ok") {
+      const phoneCode = parts[0];
+      const gameTok = parts[2].toLowerCase(); // hopqua100k / hq100k / hh200k
+      const gm = gameTok.match(/^([a-z]+)(\d+(\.\d+)?k?)$/i);
+      if (!gm) {
+        await bot.sendMessage(chatId, "Sai cú pháp. Ví dụ: ssa34 ok hopqua100k");
+        return;
+      }
+      const gameSource = normalizeGameToken(gm[1]);
+      const gameAmount = parseMoney(gm[2]);
+      if (gameAmount == null) {
+        await bot.sendMessage(chatId, "Sai tiền. Ví dụ: hopqua100k");
+        return;
+      }
+
+      const { buyPrice, profit } = await logPhoneProfit(phoneCode, gameSource, gameAmount);
+      await bot.sendMessage(chatId, `✅ Máy ${phoneCode} OK.\n• Giá mua: ${fmtMoney(buyPrice)}\n• Thưởng: ${fmtMoney(gameAmount)}\n• Lãi/lỗ: ${fmtMoney(profit)}`);
+      return;
+    }
+
+    // lot buy: mua 5may 120k
     if (cmd === "mua") {
       const qtyPart = (parts[1] || "").toLowerCase();
       const qtyMatch = qtyPart.match(/^(\d+)may$/);
@@ -789,22 +753,14 @@ bot.on("message", async (msg) => {
       const lotRow = await getLatestLot();
 
       sessions.set(String(chatId), {
-        pending: {
-          type: "ask_wallet_for_lot",
-          data: { lotRowNumber: lotRow._rowNumber, totalCost },
-        },
+        pending: { type: "ask_wallet_for_lot", data: { lotRowNumber: lotRow._rowNumber, totalCost } },
       });
 
-      await bot.sendMessage(
-        chatId,
-        `✅ Đã tạo lô ${lotRow.lotId} (${qty} máy) tổng ${fmtMoney(totalCost)}.\nTiền từ ví nào? (uri/hana/kt)`
-      );
+      await bot.sendMessage(chatId, `✅ Đã tạo lô ${lotRow.lotId} (${qty} máy) tổng ${fmtMoney(totalCost)}.\nTiền từ ví nào? (uri/hana/kt)`);
       return;
     }
 
-    // --- LOT RESULT ---
-    // A: "4may hq ok tach1"
-    // B: "5may hh800k tach1"
+    // lot result: 4may hq ok tach1  OR 5may hh800k tach1
     const mayMatch = cmd.match(/^(\d+)may$/);
     if (mayMatch) {
       const n = Number(mayMatch[1]);
@@ -814,7 +770,7 @@ bot.on("message", async (msg) => {
 
       const lotRow = await getLatestLot();
 
-      // Case B
+      // Case B: hh800k
       const t2m = token2.match(/^([a-z]+)(\d+(\.\d+)?k?)$/i);
       if (t2m && (token3.startsWith("tach") || token4.startsWith("tach"))) {
         const game = normalizeGameToken(t2m[1]);
@@ -830,61 +786,32 @@ bot.on("message", async (msg) => {
 
         await saveLotResult(lotRow, { ok, tach, game, totalReward });
         const lotCost = Number(String(lotRow.totalCost || "0").replace(/,/g, "")) || 0;
-        await bot.sendMessage(
-          chatId,
-          `✅ KQ lô gần nhất: ok=${ok}, tạch=${tach}, game=${game}, thưởng=${fmtMoney(totalReward)}\n📈 Lãi/lỗ lô = ${fmtMoney(
-            totalReward - lotCost
-          )}`
-        );
+        await bot.sendMessage(chatId, `✅ KQ lô gần nhất: ok=${ok}, tạch=${tach}, game=${game}, thưởng=${fmtMoney(totalReward)}\n📈 Lãi/lỗ = ${fmtMoney(totalReward - lotCost)}`);
         return;
       }
 
-      // Case A
-      if (
-        (token2 === "hq" || token2 === "qr" || token2 === "db") &&
-        token3 === "ok" &&
-        token4.startsWith("tach")
-      ) {
+      // Case A: 4may hq ok tach1
+      if ((token2 === "hq" || token2 === "qr" || token2 === "db") && token3 === "ok" && token4.startsWith("tach")) {
         const game = normalizeGameToken(token2);
         const tach = Number((token4.match(/^tach(\d+)$/) || [])[1] || 0);
         const ok = n;
-
         await saveLotResult(lotRow, { ok, tach, game, totalReward: null });
         await bot.sendMessage(chatId, `✅ KQ lô gần nhất: ok=${ok}, tạch=${tach}, game=${game}`);
         return;
       }
     }
 
-    // --- PHONE BUY: ssa34 35k ---
-    const maybePrice = parts[1] ? parseMoney(parts[1]) : null;
-    if (parts.length === 2 && maybePrice != null && /^[a-z0-9]+$/i.test(cmd)) {
-      const phoneCode = parts[0];
-      const buyPrice = maybePrice;
+    await bot.sendMessage(chatId, "Mình không hiểu lệnh. Gõ /help để xem cú pháp.");
+  } catch (e) {
+    console.error("handler error:", e);
+    await bot.sendMessage(chatId, `❌ Lỗi: ${e.message}`);
+  }
+});
 
-      await createPhone(chatId, phoneCode, buyPrice);
-
-      sessions.set(String(chatId), {
-        pending: {
-          type: "ask_wallet_for_phone",
-          data: { phoneCode, buyPrice },
-        },
-      });
-
-      await bot.sendMessage(
-        chatId,
-        `✅ Đã lưu mua máy ${phoneCode} giá ${fmtMoney(buyPrice)}.\nTiền từ ví nào? (uri/hana/kt)`
-      );
-      return;
-    }
-
-    // --- PHONE OK: ssa34 ok hopqua100k ---
-    if (parts.length >= 3 && /^[a-z0-9]+$/i.test(cmd) && parts[1].toLowerCase() === "ok") {
-      const phoneCode = parts[0];
-      const gameTok = parts[2].toLowerCase(); // hopqua100k / hq100k / hh200k
-      const gm = gameTok.match(/^([a-z]+)(\d+(\.\d+)?k?)$/i);
-      if (!gm) {
-        await bot.sendMessage(chatId, "Sai cú pháp. Ví dụ: ssa34 ok hopqua100k");
-        return;
-      }
-      const gameSource = normalizeGameToken(gm[1]);
-      co
+// ===== Boot =====
+(async () => {
+  await initSheet();
+  await setupBotCommands();
+  startCron();
+  console.log("✅ Bot started.");
+})();
