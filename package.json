@@ -4,7 +4,7 @@
   "description": "Telegram bot + Google Sheet DB for TikTok Lite tracking",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node src/index.js"
   },
   "engines": {
     "node": ">=18"
