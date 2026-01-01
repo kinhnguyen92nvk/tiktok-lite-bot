@@ -1,18 +1,19 @@
 {
   "name": "tiktok-lite-bot",
   "version": "1.0.0",
-  "description": "Telegram bot + Google Sheet DB for TikTok Lite tracking",
-  "main": "index.js",
+  "private": true,
+  "main": "src/index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node src/index.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": "20.x"
   },
   "dependencies": {
-    "dayjs": "^1.11.11",
-    "google-spreadsheet": "^4.1.1",
-    "node-cron": "^3.0.3",
-    "node-telegram-bot-api": "^0.66.0"
+    "dayjs": "1.11.11",
+    "google-spreadsheet": "4.1.2",
+    "google-auth-library": "9.14.2",
+    "node-cron": "3.0.3",
+    "node-telegram-bot-api": "0.66.0"
   }
 }
