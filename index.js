@@ -1,9 +1,15 @@
 /**
- * TIKTOK_LITE_BOT - CommonJS
- * Telegram bot + Google Sheets DB
+ * TikTok Lite Bot (Polling-only)
+ * - Telegram: node-telegram-bot-api (polling)
+ * - Google Sheet DB: google-spreadsheet v4 (service account JSON via secret file)
  *
- * Auth: Secret File JSON + GOOGLE_APPLICATION_CREDENTIALS path
- * -> read JSON via fs -> useServiceAccountAuth()
+ * ENV required:
+ *   BOT_TOKEN
+ *   GOOGLE_SHEET_ID
+ *   GOOGLE_APPLICATION_CREDENTIALS  (e.g. /etc/secrets/google-service-account.json)
+ * Optional:
+ *   ADMIN_TELEGRAM_ID
+ *   TZ (default Asia/Seoul)
  */
 
 const fs = require("fs");
@@ -25,34 +31,37 @@ const SHEET_ID = process.env.GOOGLE_SHEET_ID;
 const ADMIN_ID = String(process.env.ADMIN_TELEGRAM_ID || "");
 const ADC_PATH = process.env.GOOGLE_APPLICATION_CREDENTIALS;
 
-if (!BOT_TOKEN || !SHEET_ID) {
-  console.error("Missing env vars. Need BOT_TOKEN and GOOGLE_SHEET_ID");
+if (!BOT_TOKEN) {
+  console.error("Missing BOT_TOKEN");
   process.exit(1);
 }
-
+if (!SHEET_ID) {
+  console.error("Missing GOOGLE_SHEET_ID");
+  process.exit(1);
+}
 if (!ADC_PATH) {
   console.error(
-    "Missing GOOGLE_APPLICATION_CREDENTIALS. Set it to /etc/secrets/<your-secret-file>.json"
+    "Missing GOOGLE_APPLICATION_CREDENTIALS. Example: /etc/secrets/google-service-account.json"
   );
   process.exit(1);
 }
 
-// ===== BOT =====
+// ===== Telegram bot (POLLING ONLY) =====
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-
-// ===== Session state =====
-const sessions = new Map(); // chatId -> { pending: {...} }
 
 // ===== Google Sheet =====
 const doc = new GoogleSpreadsheet(SHEET_ID);
 const sheets = {}; // tabName -> worksheet
 
-function nowSeoul() {
+// ===== Session memory (due-date Q&A) =====
+const sessions = new Map(); // chatId -> { pending: {type, data} }
+
+function nowTz() {
   return dayjs().tz(TZ);
 }
 
 // ===== Money parser =====
-// 100k => 100000, 0.5k => 500, 120000 => 120000
+// Supports: 100k => 100000, 0.5k => 500, 120000 => 120000, 12,000 => 12000
 function parseMoney(input) {
   if (!input) return null;
   const s = String(input).trim().toLowerCase().replace(/,/g, "");
@@ -64,8 +73,7 @@ function parseMoney(input) {
 }
 
 function fmtMoney(n) {
-  if (n == null) return "";
-  return Number(n).toLocaleString("en-US");
+  return Number(n || 0).toLocaleString("en-US");
 }
 
 function isAdmin(msg) {
@@ -75,47 +83,38 @@ function isAdmin(msg) {
 // ===== Sheet helpers =====
 async function appendRow(tab, rowObj) {
   const ws = sheets[tab];
-  if (!ws) throw new Error(`Missing sheet tab ${tab}`);
-  return await ws.addRow(rowObj);
+  if (!ws) throw new Error(`Missing tab: ${tab}`);
+  return ws.addRow(rowObj);
 }
 
 async function getAllRows(tab) {
   const ws = sheets[tab];
-  if (!ws) throw new Error(`Missing sheet tab ${tab}`);
-  return await ws.getRows();
+  if (!ws) throw new Error(`Missing tab: ${tab}`);
+  return ws.getRows();
 }
 
 async function logUndo(action, payload) {
   if (!sheets["UNDO_LOG"]) return;
   await appendRow("UNDO_LOG", {
-    timestamp: nowSeoul().format(),
+    timestamp: nowTz().format(),
     action,
     payload: JSON.stringify(payload),
   });
 }
 
-// ===== Init Google Sheet (FIXED AUTH) =====
+// ===== Init sheet (FIXED for google-spreadsheet v4) =====
 async function initSheet() {
-  // Read creds from secret file path
   let creds;
   try {
-    const raw = fs.readFileSync(ADC_PATH, "utf8");
-    creds = JSON.parse(raw);
+    creds = JSON.parse(fs.readFileSync(ADC_PATH, "utf8"));
   } catch (e) {
-    console.error("Failed to read GOOGLE_APPLICATION_CREDENTIALS file:", ADC_PATH);
+    console.error("Failed to read service account JSON:", ADC_PATH);
     console.error(e);
     process.exit(1);
   }
 
-  if (!creds.client_email || !creds.private_key) {
-    console.error("Invalid service account JSON: missing client_email/private_key");
-    process.exit(1);
-  }
-
-  await doc.useServiceAccountAuth({
-    client_email: creds.client_email,
-    private_key: creds.private_key,
-  });
+  // v4: pass full JSON object
+  await doc.useServiceAccountAuth(creds);
 
   await doc.loadInfo();
 
@@ -136,7 +135,7 @@ async function initSheet() {
   for (const name of requiredTabs) {
     const ws = doc.sheetsByTitle[name];
     if (!ws) {
-      console.warn(`⚠️ Missing tab: ${name} (please create it in Google Sheet)`);
+      console.warn(`⚠️ Missing tab in sheet: ${name}`);
     } else {
       sheets[name] = ws;
     }
@@ -145,53 +144,23 @@ async function initSheet() {
   console.log("✅ Sheet loaded:", doc.title);
 }
 
-// ===== Wallets =====
-async function upsertWalletBalance(wallet, delta, ref = "", note = "") {
-  if (!sheets["WALLETS"] || !sheets["WALLET_LOG"]) {
-    throw new Error("Missing WALLETS or WALLET_LOG tab");
-  }
-
-  const rows = await getAllRows("WALLETS");
-  let row = rows.find((r) => String(r.Wallet || "").toLowerCase() === wallet);
-
-  if (!row) {
-    row = await appendRow("WALLETS", { Wallet: wallet, Balance: 0 });
-  }
-
-  const current = Number(String(row.Balance || "0").replace(/,/g, "")) || 0;
-  const next = current + delta;
-  row.Balance = next;
-  await row.save();
-
-  await appendRow("WALLET_LOG", {
-    timestamp: nowSeoul().format(),
-    wallet,
-    amount: delta,
-    type: delta < 0 ? "debit" : "credit",
-    ref,
-    note,
-  });
-
-  return next;
-}
-
 // ===== Commands menu =====
 async function setupBotCommands() {
   await bot.setMyCommands([
     { command: "start", description: "Bắt đầu / hướng dẫn nhanh" },
     { command: "help", description: "Xem lệnh" },
-    { command: "baocao", description: "Báo cáo tháng (tổng quan)" },
+    { command: "baocao", description: "Báo cáo tháng (tổng thu)" },
     { command: "pending", description: "Danh sách invite pending / quá hạn" },
-    { command: "undo", description: "Hoàn tác lệnh gần nhất (khung)" }
+    { command: "undo", description: "Hoàn tác (mới log UNDO_LOG)" },
   ]);
 }
 
-// ===== Core game =====
+// ===== Game revenue =====
 async function addGameRevenue(chatId, game, amount, type, note = "", meta = {}) {
   if (!sheets["GAME_REVENUE"]) throw new Error("Missing GAME_REVENUE tab");
 
   await appendRow("GAME_REVENUE", {
-    timestamp: nowSeoul().format(),
+    timestamp: nowTz().format(),
     game,
     type,
     amount,
@@ -203,10 +172,11 @@ async function addGameRevenue(chatId, game, amount, type, note = "", meta = {}) 
   await logUndo("ADD_GAME_REVENUE", { chatId, game, amount, type, note, meta });
 }
 
+// ===== Invites =====
 async function createInvite(chatId, game, name, email) {
   if (!sheets["INVITES"]) throw new Error("Missing INVITES tab");
 
-  const invitedAt = nowSeoul();
+  const invitedAt = nowTz();
   const due = invitedAt.add(14, "day");
 
   await appendRow("INVITES", {
@@ -239,7 +209,6 @@ async function markInviteDoneAndAddCheckin(chatId, game, name, email, reward) {
   }
 
   const rows = await getAllRows("INVITES");
-
   const target = rows
     .filter(
       (r) =>
@@ -248,16 +217,12 @@ async function markInviteDoneAndAddCheckin(chatId, game, name, email, reward) {
         ((email && String(r.email || "").toLowerCase() === email.toLowerCase()) ||
           String(r.name || "").toLowerCase() === name.toLowerCase())
     )
-    .sort(
-      (a, b) =>
-        new Date(b.time_invited || b.timestamp) -
-        new Date(a.time_invited || a.timestamp)
-    )[0];
+    .sort((a, b) => new Date(b.time_invited || b.timestamp) - new Date(a.time_invited || a.timestamp))[0];
 
   if (!target) throw new Error(`Không tìm thấy invite pending cho ${game} ${name}`);
 
   await appendRow("CHECKIN_REWARD", {
-    timestamp: nowSeoul().format(),
+    timestamp: nowTz().format(),
     game,
     name: target.name,
     email: target.email,
@@ -277,28 +242,19 @@ async function markInviteDoneAndAddCheckin(chatId, game, name, email, reward) {
 
   target.status = "done";
   target.checkin_reward = reward;
-  target.completed_at = nowSeoul().format();
+  target.completed_at = nowTz().format();
   await target.save();
 
   await logUndo("DONE_INVITE_CHECKIN", {
-    inviteRowId: target._rowNumber,
+    inviteRowNumber: target._rowNumber,
     chatId,
     game,
     reward,
   });
 }
 
-// ===== Normalize game token =====
-function normalizeGameToken(tok) {
-  const t = String(tok || "").toLowerCase();
-  if (t === "hopqua" || t === "hq" || t === "hh") return "hq";
-  if (t === "qr") return "qr";
-  if (t === "dabong" || t === "db") return "db";
-  return t;
-}
-
 // ===== Reports =====
-async function reportMonth(chatId, ym = nowSeoul().format("YYYY-MM")) {
+async function reportMonth(chatId, ym = nowTz().format("YYYY-MM")) {
   if (!sheets["GAME_REVENUE"]) throw new Error("Missing GAME_REVENUE tab");
 
   const rows = await getAllRows("GAME_REVENUE");
@@ -324,7 +280,7 @@ async function listPending(chatId) {
   if (!sheets["INVITES"]) throw new Error("Missing INVITES tab");
 
   const invites = await getAllRows("INVITES");
-  const now = nowSeoul();
+  const now = nowTz();
 
   const pending = invites
     .filter((r) => String(r.status || "").toLowerCase() === "pending")
@@ -353,7 +309,7 @@ async function runDueCheck() {
     if (!sheets["INVITES"]) return;
 
     const invites = await getAllRows("INVITES");
-    const now = nowSeoul();
+    const now = nowTz();
 
     for (const r of invites) {
       if (String(r.status || "").toLowerCase() !== "pending") continue;
@@ -368,12 +324,13 @@ async function runDueCheck() {
         if (remindedToday) continue;
 
         const chatId = r.chatId;
-        const gameLabel = String(r.game || "").toLowerCase() === "hq" ? "Hopqua" : "QR";
+        const game = String(r.game || "").toLowerCase();
+        const gameLabel = game === "hq" ? "Hopqua" : game === "qr" ? "QR" : game;
 
         sessions.set(String(chatId), {
           pending: {
             type: "ask_checkin_reward",
-            data: { game: String(r.game || "").toLowerCase(), name: r.name, email: r.email },
+            data: { game, name: r.name, email: r.email },
           },
         });
 
@@ -388,58 +345,44 @@ async function runDueCheck() {
 }
 
 function startCron() {
-  cron.schedule("0 10 * * *", runDueCheck, { timezone: TZ });
+  // check hourly + daily 10:00
   cron.schedule("15 * * * *", runDueCheck, { timezone: TZ });
+  cron.schedule("0 10 * * *", runDueCheck, { timezone: TZ });
 }
 
-// ===== Session helpers =====
-function getSession(chatId) {
-  return sessions.get(String(chatId));
-}
-function clearSession(chatId) {
-  sessions.delete(String(chatId));
-}
-
-// ===== Follow-up handlers =====
-async function handleCheckinAnswer(chatId, text, context) {
+// ===== Follow-up handler =====
+async function handleCheckinAnswer(chatId, text, pending) {
   const reward = parseMoney(text);
   if (reward == null) {
     await bot.sendMessage(chatId, "Không parse được tiền. Ví dụ: 60k hoặc 30000");
     return;
   }
-  const { game, name, email } = context.data;
+
+  const { game, name, email } = pending.data;
   await markInviteDoneAndAddCheckin(chatId, game, name, email, reward);
-  clearSession(chatId);
+
+  sessions.delete(String(chatId));
   await bot.sendMessage(chatId, `✅ Checkin ${game} ${name}: +${fmtMoney(reward)}`);
 }
 
-function parseCommand(text) {
-  const raw = String(text || "").trim();
-  const parts = raw.split(/\s+/);
-  return { raw, parts };
-}
-
-// ===== Main message handler =====
+// ===== Message handler =====
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text || "";
 
   try {
-    // Follow-up
-    const sess = getSession(chatId);
-    if (sess?.pending?.type) {
-      const pending = sess.pending;
-      if (pending.type === "ask_checkin_reward") {
-        await handleCheckinAnswer(chatId, text, pending);
-        return;
-      }
+    // follow-up
+    const sess = sessions.get(String(chatId));
+    if (sess?.pending?.type === "ask_checkin_reward") {
+      await handleCheckinAnswer(chatId, text, sess.pending);
+      return;
     }
 
-    // Slash commands
+    // slash commands
     if (text.startsWith("/start")) {
       await bot.sendMessage(
         chatId,
-        "✅ TIKTOK_LITE_BOT\n\n" +
+        "✅ TIKTOK_LITE_BOT (Polling)\n\n" +
           "Gõ nhanh:\n" +
           "• dabong 100k\n" +
           "• hopqua Khanh mail@gmail.com\n" +
@@ -487,13 +430,13 @@ bot.on("message", async (msg) => {
       return;
     }
 
-    // Free text commands
-    const { parts } = parseCommand(text);
-    if (parts.length === 0) return;
+    // free-text commands
+    const parts = String(text).trim().split(/\s+/);
+    if (!parts[0]) return;
 
     const cmd = parts[0].toLowerCase();
 
-    // GAME: dabong
+    // db / dabong
     if (cmd === "dabong" || cmd === "db") {
       const amount = parseMoney(parts[1]);
       if (amount == null) {
@@ -505,8 +448,9 @@ bot.on("message", async (msg) => {
       return;
     }
 
-    // GAME: hopqua
+    // hopqua / hq
     if (cmd === "hopqua" || cmd === "hq") {
+      // hopqua 200k
       if (parts.length === 2) {
         const amount = parseMoney(parts[1]);
         if (amount == null) {
@@ -518,6 +462,7 @@ bot.on("message", async (msg) => {
         return;
       }
 
+      // hopqua Name Email
       if (parts.length >= 3) {
         const name = parts[1];
         const email = parts[2];
@@ -533,8 +478,9 @@ bot.on("message", async (msg) => {
       return;
     }
 
-    // GAME: qr
+    // qr
     if (cmd === "qr") {
+      // qr 57k
       if (parts.length === 2) {
         const amount = parseMoney(parts[1]);
         if (amount == null) {
@@ -546,6 +492,7 @@ bot.on("message", async (msg) => {
         return;
       }
 
+      // qr Name Email
       if (parts.length >= 3) {
         const name = parts[1];
         const email = parts[2];
@@ -573,39 +520,13 @@ bot.on("message", async (msg) => {
       return;
     }
 
-    // admin set wallet (optional)
+    // admin example: chinh hana 500k (optional)
     if (cmd === "chinh") {
       if (!isAdmin(msg)) {
         await bot.sendMessage(chatId, "⛔ Bạn không có quyền dùng lệnh này.");
         return;
       }
-      const wallet = (parts[1] || "").toLowerCase();
-      const amount = parseMoney(parts[2]);
-      if (!["uri", "hana", "kt"].includes(wallet) || amount == null) {
-        await bot.sendMessage(chatId, "Sai cú pháp. Ví dụ: chinh hana 500k");
-        return;
-      }
-
-      const rows = await getAllRows("WALLETS");
-      let row = rows.find((r) => String(r.Wallet || "").toLowerCase() === wallet);
-      if (!row) row = await appendRow("WALLETS", { Wallet: wallet, Balance: 0 });
-
-      const current = Number(String(row.Balance || "0").replace(/,/g, "")) || 0;
-      const delta = amount - current;
-
-      row.Balance = amount;
-      await row.save();
-
-      await appendRow("WALLET_LOG", {
-        timestamp: nowSeoul().format(),
-        wallet,
-        amount: delta,
-        type: "admin_set",
-        ref: "ADMIN_SET",
-        note: `set balance to ${amount}`,
-      });
-
-      await bot.sendMessage(chatId, `✅ Set ví ${wallet} = ${fmtMoney(amount)} (delta ${fmtMoney(delta)})`);
+      await bot.sendMessage(chatId, "Lệnh admin chưa implement đầy đủ ở bản này.");
       return;
     }
 
@@ -621,5 +542,5 @@ bot.on("message", async (msg) => {
   await initSheet();
   await setupBotCommands();
   startCron();
-  console.log("✅ Bot started.");
+  console.log("✅ TikTok Lite Bot started (polling).");
 })();
