@@ -1,6 +1,7 @@
 /**
- * TIKTOK_LITE_BOT - CommonJS (require)
+ * TIKTOK_LITE_BOT - CommonJS
  * Telegram bot + Google Sheets DB
+ * Auth: Application Default Credentials via GOOGLE_APPLICATION_CREDENTIALS
  */
 
 const TelegramBot = require("node-telegram-bot-api");
@@ -18,19 +19,21 @@ const TZ = process.env.TZ || "Asia/Seoul";
 // ===== ENV =====
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SHEET_ID = process.env.GOOGLE_SHEET_ID;
-const SA_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
-let SA_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY;
 const ADMIN_ID = String(process.env.ADMIN_TELEGRAM_ID || "");
+const ADC_PATH = process.env.GOOGLE_APPLICATION_CREDENTIALS;
 
-if (!BOT_TOKEN || !SHEET_ID || !SA_EMAIL || !SA_PRIVATE_KEY) {
-  console.error(
-    "Missing env vars. Need BOT_TOKEN, GOOGLE_SHEET_ID, GOOGLE_SERVICE_ACCOUNT_EMAIL, GOOGLE_PRIVATE_KEY"
-  );
+if (!BOT_TOKEN || !SHEET_ID) {
+  console.error("Missing env vars. Need BOT_TOKEN and GOOGLE_SHEET_ID");
   process.exit(1);
 }
 
-// Render often stores \n as literal "\\n"
-SA_PRIVATE_KEY = SA_PRIVATE_KEY.replace(/\\n/g, "\n");
+// ADC is not strictly required to be present as env if runtime already has ADC,
+// but on Render you will use GOOGLE_APPLICATION_CREDENTIALS -> /etc/secrets/xxx.json
+if (!ADC_PATH) {
+  console.warn(
+    "⚠️ GOOGLE_APPLICATION_CREDENTIALS is not set. If auth fails, set it to /etc/secrets/<your-json-file>."
+  );
+}
 
 // ===== BOT =====
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
@@ -43,10 +46,8 @@ const doc = new GoogleSpreadsheet(SHEET_ID);
 const sheets = {}; // tabName -> worksheet
 
 async function initSheet() {
-  await doc.useServiceAccountAuth({
-    client_email: SA_EMAIL,
-    private_key: SA_PRIVATE_KEY,
-  });
+  // IMPORTANT: use ADC (reads GOOGLE_APPLICATION_CREDENTIALS)
+  await doc.useApplicationDefaultCredentials();
 
   await doc.loadInfo();
 
@@ -231,10 +232,14 @@ async function markInviteDoneAndAddCheckin(chatId, game, name, email, reward) {
     chatId,
   });
 
-  await addGameRevenue(chatId, game, reward, "checkin_reward", `checkin 14 ngày: ${target.name}`, {
-    name: target.name,
-    email: target.email,
-  });
+  await addGameRevenue(
+    chatId,
+    game,
+    reward,
+    "checkin_reward",
+    `checkin 14 ngày: ${target.name}`,
+    { name: target.name, email: target.email }
+  );
 
   target.status = "done";
   target.checkin_reward = reward;
@@ -472,7 +477,10 @@ async function handleWalletAnswer(chatId, wallet, context) {
     await setPhoneWallet(phoneCode, w);
     const newBal = await upsertWalletBalance(w, -buyPrice, `PHONE:${phoneCode}`, "buy phone");
     clearSession(chatId);
-    await bot.sendMessage(chatId, `✅ Mua máy ${phoneCode}: -${fmtMoney(buyPrice)} từ ví ${w}. Balance: ${fmtMoney(newBal)}`);
+    await bot.sendMessage(
+      chatId,
+      `✅ Mua máy ${phoneCode}: -${fmtMoney(buyPrice)} từ ví ${w}. Balance: ${fmtMoney(newBal)}`
+    );
     return;
   }
 
@@ -485,7 +493,10 @@ async function handleWalletAnswer(chatId, wallet, context) {
     await setLotWallet(lotRow, w);
     const newBal = await upsertWalletBalance(w, -totalCost, `LOT:${lotRow.lotId}`, "buy lot");
     clearSession(chatId);
-    await bot.sendMessage(chatId, `✅ Mua lô ${lotRow.lotId}: -${fmtMoney(totalCost)} từ ví ${w}. Balance: ${fmtMoney(newBal)}`);
+    await bot.sendMessage(
+      chatId,
+      `✅ Mua lô ${lotRow.lotId}: -${fmtMoney(totalCost)} từ ví ${w}. Balance: ${fmtMoney(newBal)}`
+    );
     return;
   }
 }
@@ -733,7 +744,10 @@ bot.on("message", async (msg) => {
       }
 
       const { buyPrice, profit } = await logPhoneProfit(phoneCode, gameSource, gameAmount);
-      await bot.sendMessage(chatId, `✅ Máy ${phoneCode} OK.\n• Giá mua: ${fmtMoney(buyPrice)}\n• Thưởng: ${fmtMoney(gameAmount)}\n• Lãi/lỗ: ${fmtMoney(profit)}`);
+      await bot.sendMessage(
+        chatId,
+        `✅ Máy ${phoneCode} OK.\n• Giá mua: ${fmtMoney(buyPrice)}\n• Thưởng: ${fmtMoney(gameAmount)}\n• Lãi/lỗ: ${fmtMoney(profit)}`
+      );
       return;
     }
 
@@ -786,12 +800,21 @@ bot.on("message", async (msg) => {
 
         await saveLotResult(lotRow, { ok, tach, game, totalReward });
         const lotCost = Number(String(lotRow.totalCost || "0").replace(/,/g, "")) || 0;
-        await bot.sendMessage(chatId, `✅ KQ lô gần nhất: ok=${ok}, tạch=${tach}, game=${game}, thưởng=${fmtMoney(totalReward)}\n📈 Lãi/lỗ = ${fmtMoney(totalReward - lotCost)}`);
+        await bot.sendMessage(
+          chatId,
+          `✅ KQ lô gần nhất: ok=${ok}, tạch=${tach}, game=${game}, thưởng=${fmtMoney(totalReward)}\n📈 Lãi/lỗ = ${fmtMoney(
+            totalReward - lotCost
+          )}`
+        );
         return;
       }
 
       // Case A: 4may hq ok tach1
-      if ((token2 === "hq" || token2 === "qr" || token2 === "db") && token3 === "ok" && token4.startsWith("tach")) {
+      if (
+        (token2 === "hq" || token2 === "qr" || token2 === "db") &&
+        token3 === "ok" &&
+        token4.startsWith("tach")
+      ) {
         const game = normalizeGameToken(token2);
         const tach = Number((token4.match(/^tach(\d+)$/) || [])[1] || 0);
         const ok = n;
